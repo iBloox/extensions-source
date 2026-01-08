@@ -32,26 +32,38 @@ class WaveTeamy : ParsedHttpSource() {
 
     // Popular - Main grid of series
     override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/series?page=$page", headers)
+        val url = if (page == 1) {
+            "$baseUrl/series"
+        } else {
+            "$baseUrl/series?page=$page"
+        }
+        return GET(url, headers)
     }
 
-    override fun popularMangaSelector() = "div.grid a[href*='/series/']"
+    override fun popularMangaSelector() = "a[href*='/series/']:has(img), div[class*='grid'] a[href*='/series/'], div[class*='card'] a[href*='/series/']"
 
     override fun popularMangaFromElement(element: Element): SManga {
         return SManga.create().apply {
             setUrlWithoutDomain(element.attr("href"))
 
-            // Get title from h3 or img alt
-            title = element.select("h3").text().ifEmpty {
-                element.select("img").attr("alt")
+            // Get title from various possible locations
+            title = element.select("h3, h2, h4").text().ifEmpty {
+                element.select("img").attr("alt").ifEmpty {
+                    element.select("img").attr("title").ifEmpty {
+                        element.attr("title")
+                    }
+                }
             }
 
-            // Get thumbnail
-            thumbnail_url = element.select("img").attr("abs:src")
+            // Get thumbnail from img tag
+            val img = element.select("img").first()
+            thumbnail_url = img?.attr("abs:src")?.ifEmpty {
+                img.attr("abs:data-src")
+            } ?: ""
         }
     }
 
-    override fun popularMangaNextPageSelector() = "a[rel=next], a:contains(Next)"
+    override fun popularMangaNextPageSelector() = "a[rel=next], a:contains(Next), a:contains(التالي), button:contains(Next), button:contains(التالي)"
 
     // Latest - Same as popular for now
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
@@ -64,10 +76,14 @@ class WaveTeamy : ParsedHttpSource() {
 
     // Search
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/series".toHttpUrl().newBuilder()
-            .addQueryParameter("search", query)
-            .addQueryParameter("page", page.toString())
-            .build()
+        val url = if (query.isNotEmpty()) {
+            "$baseUrl/series".toHttpUrl().newBuilder()
+                .addQueryParameter("search", query)
+                .apply { if (page > 1) addQueryParameter("page", page.toString()) }
+                .build()
+        } else {
+            popularMangaRequest(page).url
+        }
         return GET(url, headers)
     }
 
@@ -111,30 +127,43 @@ class WaveTeamy : ParsedHttpSource() {
     }
 
     // Chapters
-    override fun chapterListSelector() = "a[href*='/chapter/'], a[href*='/series/'][href*='/chapter']"
+    override fun chapterListSelector() = "a[href*='/chapter/'], a[href*='/ch/'], div[class*='chapter'] a, li[class*='chapter'] a"
 
     override fun chapterFromElement(element: Element): SChapter {
         return SChapter.create().apply {
-            setUrlWithoutDomain(element.attr("href"))
+            val href = element.attr("href")
+            setUrlWithoutDomain(href)
 
-            // Chapter name
-            name = element.select("span, p, h3, h4").text().ifEmpty {
-                element.text()
+            // Chapter name - try multiple selectors
+            name = element.select("span, p, h3, h4, div").text().ifEmpty {
+                element.text().ifEmpty {
+                    // Extract chapter number from URL as fallback
+                    href.substringAfterLast("/").replace("-", " ")
+                }
             }
 
             // Date - try to parse if available
-            date_upload = 0L // Will be 0 if not found
+            date_upload = 0L
         }
     }
 
     // Pages
     override fun pageListParse(document: Document): List<Page> {
-        return document.select("img[src*='wcloud'], img[src*='cdn'], div.reader img").mapIndexed { index, element ->
-            Page(
-                index,
-                "",
-                element.attr("abs:src").ifEmpty { element.attr("abs:data-src") },
-            )
+        // Try multiple selectors for images
+        val images = document.select("img[src*='wcloud'], img[src*='cdn'], div[class*='reader'] img, div[class*='page'] img, img[class*='page']")
+        
+        return images.mapIndexedNotNull { index, element ->
+            val imageUrl = element.attr("abs:src").ifEmpty {
+                element.attr("abs:data-src").ifEmpty {
+                    element.attr("data-lazy-src")
+                }
+            }
+            
+            if (imageUrl.isNotEmpty()) {
+                Page(index, "", imageUrl)
+            } else {
+                null
+            }
         }
     }
 
