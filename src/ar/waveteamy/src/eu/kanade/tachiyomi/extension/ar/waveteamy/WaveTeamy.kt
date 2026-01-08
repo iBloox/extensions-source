@@ -7,17 +7,18 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.ParsedHttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
+import org.jsoup.Jsoup
 import java.util.concurrent.TimeUnit
 
-class WaveTeamy : ParsedHttpSource() {
+class WaveTeamy : HttpSource() {
 
     override val name = "WaveTeamy"
 
@@ -27,6 +28,11 @@ class WaveTeamy : ParsedHttpSource() {
 
     override val supportsLatest = true
 
+    private val json = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
+
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -35,35 +41,19 @@ class WaveTeamy : ParsedHttpSource() {
 
     // Popular
     override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/", headers)
+        return GET("$baseUrl/api/series-list", headers)
     }
-
-    override fun popularMangaSelector() = "a[href*='/series/']"
-
-    override fun popularMangaFromElement(element: Element): SManga {
-        return SManga.create().apply {
-            setUrlWithoutDomain(element.attr("href"))
-
-            // Title from img alt or strong/h3 text
-            title = element.select("img").attr("alt").ifEmpty {
-                element.select("strong, h3, h2").text().ifEmpty {
-                    element.text().substringBefore("مستمر").substringBefore("منتهي").trim()
-                }
-            }
-
-            // Thumbnail
-            thumbnail_url = element.select("img").attr("abs:src")
-        }
-    }
-
-    override fun popularMangaNextPageSelector() = null
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val mangas = document.select(popularMangaSelector())
-            .distinctBy { it.attr("href") }
-            .map { popularMangaFromElement(it) }
-            .filter { it.title.isNotEmpty() && it.url.isNotEmpty() }
+        val seriesList = json.decodeFromString<List<SeriesDto>>(response.body.string())
+
+        val mangas = seriesList.map { series ->
+            SManga.create().apply {
+                url = "/series/${series.postId}"
+                title = series.title
+                thumbnail_url = "$baseUrl/${series.imageUrl}"
+            }
+        }
 
         return MangasPage(mangas, false)
     }
@@ -71,48 +61,41 @@ class WaveTeamy : ParsedHttpSource() {
     // Latest
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
 
-    override fun latestUpdatesSelector() = popularMangaSelector()
-
-    override fun latestUpdatesFromElement(element: Element) = popularMangaFromElement(element)
-
-    override fun latestUpdatesNextPageSelector() = popularMangaNextPageSelector()
+    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
 
     // Search
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/series".toHttpUrl().newBuilder()
+        val url = "$baseUrl/api/series-list".toHttpUrl().newBuilder()
             .apply {
                 if (query.isNotEmpty()) {
                     addQueryParameter("search", query)
-                }
-                if (page > 1) {
-                    addQueryParameter("page", page.toString())
                 }
             }
             .build()
         return GET(url, headers)
     }
 
-    override fun searchMangaSelector() = popularMangaSelector()
-
-    override fun searchMangaFromElement(element: Element) = popularMangaFromElement(element)
-
-    override fun searchMangaNextPageSelector() = "a:contains(التالي), a:contains(Next)"
+    override fun searchMangaParse(response: Response): MangasPage {
+        return popularMangaParse(response)
+    }
 
     // Manga Details
-    override fun mangaDetailsParse(document: Document): SManga {
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        return GET(baseUrl + manga.url, headers)
+    }
+
+    override fun mangaDetailsParse(response: Response): SManga {
+        val document = Jsoup.parse(response.body.string())
+
         return SManga.create().apply {
-            // Title
             title = document.select("h1").first()?.text() ?: ""
 
-            // Description
-            description = document.select("div:contains(القصة) + div, p:contains(القصة)").text()
-                .replace("القصة", "").trim()
+            description = document.select("div:contains(القصة)").parents().first()
+                ?.text()?.substringAfter("القصة")?.trim() ?: ""
 
-            // Thumbnail
             thumbnail_url = document.select("img[src*='wcloud'], img[src*='cover']")
                 .first()?.attr("abs:src") ?: ""
 
-            // Status
             val statusText = document.text()
             status = when {
                 statusText.contains("مستمر") -> SManga.ONGOING
@@ -121,33 +104,39 @@ class WaveTeamy : ParsedHttpSource() {
                 else -> SManga.UNKNOWN
             }
 
-            // Genre
             genre = document.select("a[href*='/genre/']").joinToString { it.text() }
 
-            // Author
             author = document.select("div:contains(المؤلف), span:contains(المؤلف)")
                 .text().replace("المؤلف:", "").replace("المؤلف", "").trim()
         }
     }
 
     // Chapters
-    override fun chapterListSelector() = "a[href*='/chapter/'], a[href*='/ch/']"
+    override fun chapterListRequest(manga: SManga): Request {
+        return GET(baseUrl + manga.url, headers)
+    }
 
-    override fun chapterFromElement(element: Element): SChapter {
-        return SChapter.create().apply {
-            setUrlWithoutDomain(element.attr("href"))
+    override fun chapterListParse(response: Response): List<SChapter> {
+        val document = Jsoup.parse(response.body.string())
 
-            // Chapter name
-            name = element.text().ifEmpty {
-                element.attr("href").substringAfterLast("/").replace("-", " ")
+        return document.select("a[href*='/chapter/'], a[href*='/ch/']").map { element ->
+            SChapter.create().apply {
+                setUrlWithoutDomain(element.attr("href"))
+                name = element.text().ifEmpty {
+                    element.attr("href").substringAfterLast("/").replace("-", " ")
+                }
+                date_upload = 0L
             }
-
-            date_upload = 0L
         }
     }
 
     // Pages
-    override fun pageListParse(document: Document): List<Page> {
+    override fun pageListRequest(chapter: SChapter): Request {
+        return GET(baseUrl + chapter.url, headers)
+    }
+
+    override fun pageListParse(response: Response): List<Page> {
+        val document = Jsoup.parse(response.body.string())
         val images = document.select("img[src*='wcloud'], img[src*='cdn'], img[class*='page']")
 
         return images.mapIndexedNotNull { index, element ->
@@ -163,7 +152,19 @@ class WaveTeamy : ParsedHttpSource() {
         }
     }
 
-    override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response): String {
+        throw UnsupportedOperationException()
+    }
 
     override fun getFilterList() = FilterList()
+
+    @Serializable
+    data class SeriesDto(
+        val id: Int,
+        val title: String,
+        val imageUrl: String,
+        val ratingValue: Double,
+        val statusValue: Int,
+        val postId: Long,
+    )
 }
