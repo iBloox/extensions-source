@@ -62,7 +62,7 @@ class WaveTeamy : HttpSource() {
             SManga.create().apply {
                 url = "/series/${series.postId}"
                 title = series.title
-                thumbnail_url = "$baseUrl/${series.imageUrl}"
+                thumbnail_url = "https://wcloud.site/${series.imageUrl}"
             }
         }
 
