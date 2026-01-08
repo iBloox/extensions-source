@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.ar.waveteamy
 
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -11,7 +12,8 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.FormBody
+import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -39,9 +41,18 @@ class WaveTeamy : HttpSource() {
         .rateLimit(10, 1, TimeUnit.SECONDS)
         .build()
 
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .add("Accept", "*/*")
+        .add("Origin", baseUrl)
+        .add("Referer", "$baseUrl/series")
+
     // Popular
     override fun popularMangaRequest(page: Int): Request {
-        return GET("$baseUrl/api/series-list", headers)
+        val formBody = FormBody.Builder()
+            .add("page", page.toString())
+            .build()
+
+        return POST("$baseUrl/wapi/hanout/v1/series/series-list", headers, formBody)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -65,14 +76,16 @@ class WaveTeamy : HttpSource() {
 
     // Search
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/api/series-list".toHttpUrl().newBuilder()
+        val formBody = FormBody.Builder()
+            .add("page", page.toString())
             .apply {
                 if (query.isNotEmpty()) {
-                    addQueryParameter("search", query)
+                    add("search", query)
                 }
             }
             .build()
-        return GET(url, headers)
+
+        return POST("$baseUrl/wapi/hanout/v1/series/series-list", headers, formBody)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
