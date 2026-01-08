@@ -151,14 +151,14 @@ class WaveTeamy : ParsedHttpSource() {
     override fun pageListParse(document: Document): List<Page> {
         // Try multiple selectors for images
         val images = document.select("img[src*='wcloud'], img[src*='cdn'], div[class*='reader'] img, div[class*='page'] img, img[class*='page']")
-        
+
         return images.mapIndexedNotNull { index, element ->
             val imageUrl = element.attr("abs:src").ifEmpty {
                 element.attr("abs:data-src").ifEmpty {
                     element.attr("data-lazy-src")
                 }
             }
-            
+
             if (imageUrl.isNotEmpty()) {
                 Page(index, "", imageUrl)
             } else {
