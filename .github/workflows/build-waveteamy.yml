@@ -24,19 +24,14 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build WaveTeamy extension
-        run: ./gradlew :ar:waveteamy:assembleRelease
-
-      - name: Sign APK (if keys available)
-        continue-on-error: true
-        run: |
-          if [ -f "signingkey.jks" ]; then
-            echo "Signing key found, APK will be signed"
-          else
-            echo "No signing key, APK will be unsigned (debug signed)"
-          fi
+        run: ./gradlew :src:ar:waveteamy:assembleDebug
+        env:
+          KEY_STORE_PASSWORD: ""
+          ALIAS: ""
+          KEY_PASSWORD: ""
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: waveteamy-extension
-          path: src/ar/waveteamy/build/outputs/apk/release/*.apk
+          path: src/ar/waveteamy/build/outputs/apk/debug/*.apk
