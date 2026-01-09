@@ -193,11 +193,8 @@ class WaveTeamy : HttpSource() {
 
         val chapters = mutableListOf<SChapter>()
 
-        // Extract seriesId (postId) - use escaped format
-        val seriesId = extractJsonNumber(html, "postId").ifEmpty {
-            val urlMatch = """/series/(\d+)""".toRegex().find(html)
-            urlMatch?.groupValues?.get(1) ?: ""
-        }
+        // Extract seriesId from the request URL
+        val seriesId = response.request.url.pathSegments.getOrNull(1) ?: ""
 
         // Extract chapters using escaped JSON format
         // Pattern: {\"id\":number,\"chapter\":number,...}
