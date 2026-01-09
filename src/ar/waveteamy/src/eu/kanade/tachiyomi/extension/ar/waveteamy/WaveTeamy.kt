@@ -239,6 +239,22 @@ class WaveTeamy : HttpSource() {
             )
         }
 
+        // Fallback: If no chapters found, try HTML parsing
+        if (chapters.isEmpty()) {
+            val document = Jsoup.parse(html)
+            document.select("a[href*='/chapter/'], a[href*='/ch/']").forEach { element ->
+                chapters.add(
+                    SChapter.create().apply {
+                        setUrlWithoutDomain(element.attr("href"))
+                        name = element.text().ifEmpty {
+                            element.attr("href").substringAfterLast("/").replace("-", " ")
+                        }
+                        date_upload = 0L
+                    },
+                )
+            }
+        }
+
         return chapters.reversed() // Reverse to show newest first
     }
 
