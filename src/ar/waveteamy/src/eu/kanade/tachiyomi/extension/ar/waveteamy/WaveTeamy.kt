@@ -225,16 +225,18 @@ class WaveTeamy : HttpSource() {
                 postTime = timeMatch?.groupValues?.get(1) ?: ""
             }
 
-            chapters.add(SChapter.create().apply {
-                url = "/series/$seriesId/chapter/$chapterId"
-                name = if (chapterTitle.isNotEmpty() && chapterTitle != " " && chapterTitle != "\n") {
-                    "الفصل $chapterNum: $chapterTitle"
-                } else {
-                    "الفصل $chapterNum"
-                }
-                date_upload = parseDate(postTime)
-                chapter_number = chapterNum.toFloatOrNull() ?: -1f
-            })
+            chapters.add(
+                SChapter.create().apply {
+                    url = "/series/$seriesId/chapter/$chapterId"
+                    name = if (chapterTitle.isNotEmpty() && chapterTitle != " " && chapterTitle != "\n") {
+                        "الفصل $chapterNum: $chapterTitle"
+                    } else {
+                        "الفصل $chapterNum"
+                    }
+                    date_upload = parseDate(postTime)
+                    chapter_number = chapterNum.toFloatOrNull() ?: -1f
+                },
+            )
         }
 
         return chapters.reversed() // Reverse to show newest first
@@ -256,8 +258,12 @@ class WaveTeamy : HttpSource() {
                     java.util.Calendar.getInstance().apply {
                         set(year, month, day)
                     }.timeInMillis
-                } else 0L
-            } else 0L
+                } else {
+                    0L
+                }
+            } else {
+                0L
+            }
         } catch (e: Exception) {
             0L
         }
