@@ -30,7 +30,7 @@ class WaveTeamy : HttpSource() {
 
     override val lang = "ar"
 
-    override val supportsLatest = true
+    override val supportsLatest = false
 
     private val json: Json by injectLazy()
 
@@ -69,7 +69,7 @@ class WaveTeamy : HttpSource() {
         return MangasPage(mangas, seriesList.size >= 20)
     }
 
-    // Latest
+    // Latest - not supported, use popular instead
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
@@ -99,62 +99,41 @@ class WaveTeamy : HttpSource() {
         val html = response.body.string()
 
         return SManga.create().apply {
-            // Find mangaData JSON - extract just the object content
-            val mangaDataStart = html.indexOf("\"mangaData\":{")
-            if (mangaDataStart != -1) {
-                val objectStart = mangaDataStart + "\"mangaData\":{".length
-                var braceCount = 1
-                var objectEnd = objectStart
+            // Data is double-escaped: \\\"field\\\":\\\"value\\\"
+            title = extractDoubleEscapedField(html, "name") ?: ""
+            description = extractDoubleEscapedField(html, "story")?.replace("\\\\n", "\n")?.replace("\\n", "\n")
+            author = extractDoubleEscapedField(html, "author")
+            artist = extractDoubleEscapedField(html, "artist")
 
-                for (i in objectStart until html.length) {
-                    when (html[i]) {
-                        '{' -> braceCount++
-                        '}' -> {
-                            braceCount--
-                            if (braceCount == 0) {
-                                objectEnd = i
-                                break
-                            }
-                        }
-                    }
-                }
+            val coverPath = extractDoubleEscapedField(html, "cover")
+            thumbnail_url = coverPath?.let { "https://wcloud.site/$it" }
 
-                val mangaJson = html.substring(objectStart, objectEnd)
-
-                // Extract fields from the JSON content
-                title = extractJsonString(mangaJson, "name") ?: ""
-                description = extractJsonString(mangaJson, "story")?.replace("\\n", "\n")
-                author = extractJsonString(mangaJson, "author")
-                artist = extractJsonString(mangaJson, "artist")
-
-                val coverPath = extractJsonString(mangaJson, "cover")
-                thumbnail_url = coverPath?.let { "https://wcloud.site/$it" }
-
-                val statusValue = extractJsonInt(mangaJson, "status")
-                status = when (statusValue) {
-                    0 -> SManga.ONGOING
-                    1 -> SManga.COMPLETED
-                    2 -> SManga.ON_HIATUS
-                    else -> SManga.UNKNOWN
-                }
-
-                val typeValue = extractJsonString(mangaJson, "type") ?: ""
-                genre = typeValue.takeIf { it.isNotEmpty() }
+            val statusValue = extractDoubleEscapedInt(html, "status")
+            status = when (statusValue) {
+                0 -> SManga.ONGOING
+                1 -> SManga.COMPLETED
+                2 -> SManga.ON_HIATUS
+                else -> SManga.UNKNOWN
             }
+
+            val typeValue = extractDoubleEscapedField(html, "type") ?: ""
+            genre = typeValue.takeIf { it.isNotEmpty() }
         }
     }
 
-    private fun extractJsonString(json: String, field: String): String? {
-        val pattern = """"$field":"([^"\\]*(?:\\.[^"\\]*)*)"""".toRegex()
-        return pattern.find(json)?.groupValues?.get(1)
+    private fun extractDoubleEscapedField(html: String, field: String): String? {
+        // Pattern for double-escaped JSON: \\\"field\\\":\\\"value\\\"
+        val pattern = """\\\\?"$field\\\\?":\\\\?"([^\\]*(?:\\\\.[^\\]*)*)\\\\?"""".toRegex()
+        val match = pattern.find(html)
+        return match?.groupValues?.get(1)
+            ?.replace("\\\\\"", "\"")
             ?.replace("\\\"", "\"")
-            ?.replace("\\n", "\n")
-            ?.replace("\\\\", "\\")
     }
 
-    private fun extractJsonInt(json: String, field: String): Int? {
-        val pattern = """"$field":(\d+)""".toRegex()
-        return pattern.find(json)?.groupValues?.get(1)?.toIntOrNull()
+    private fun extractDoubleEscapedInt(html: String, field: String): Int? {
+        val pattern = """\\\\?"$field\\\\?":(\d+)""".toRegex()
+        val match = pattern.find(html)
+        return match?.groupValues?.get(1)?.toIntOrNull()
     }
 
     // Chapters
@@ -168,75 +147,40 @@ class WaveTeamy : HttpSource() {
 
         val seriesId = response.request.url.pathSegments.lastOrNull() ?: ""
 
-        // Find chaptersData array: "chaptersData":[{...},{...},...]
-        val chaptersStart = html.indexOf("\"chaptersData\":[")
-        if (chaptersStart == -1) return chapters
+        // Pattern for double-escaped chapter data:
+        // {\\\"id\\\":15726,\\\"chapter\\\":76,...\\\"postTime\\\":\\\"2026-01-12 20:38:40\\\",...}
+        val chapterPattern = """\{\\\\?"id\\\\?":(\d+),\\\\?"chapter\\\\?":(\d+),[^}]*\\\\?"postTime\\\\?":\\\\?"([^\\"]*)\\\\?"[^}]*\}""".toRegex()
 
-        val arrayStart = chaptersStart + "\"chaptersData\":[".length
-        var bracketCount = 1
-        var arrayEnd = arrayStart
-
-        for (i in arrayStart until html.length) {
-            when (html[i]) {
-                '[' -> bracketCount++
-                ']' -> {
-                    bracketCount--
-                    if (bracketCount == 0) {
-                        arrayEnd = i
-                        break
-                    }
-                }
-            }
-        }
-
-        val chaptersJson = html.substring(arrayStart, arrayEnd)
-
-        // Parse each chapter object
-        val chapterPattern = """\{"id":(\d+),"chapter":(\d+),[^}]*"title":([^,]*)[^}]*"postTime":"([^"]*)"[^}]*\}""".toRegex()
-
-        chapterPattern.findAll(chaptersJson).forEach { match ->
+        chapterPattern.findAll(html).forEach { match ->
             val chapterId = match.groupValues[1]
             val chapterNum = match.groupValues[2]
-            val titleRaw = match.groupValues[3]
-            val postTime = match.groupValues[4]
-
-            // Parse title - can be null or "string"
-            val chapterTitle = if (titleRaw == "null") {
-                ""
-            } else {
-                titleRaw.trim('"').trim()
-            }
+            val postTime = match.groupValues[3]
 
             chapters.add(
                 SChapter.create().apply {
                     url = "/series/$seriesId/$chapterId"
-                    name = if (chapterTitle.isNotEmpty()) {
-                        "الفصل $chapterNum: $chapterTitle"
-                    } else {
-                        "الفصل $chapterNum"
-                    }
+                    name = "الفصل $chapterNum"
                     date_upload = parseDate(postTime)
                     chapter_number = chapterNum.toFloatOrNull() ?: -1f
                 },
             )
         }
 
-        return chapters
+        return chapters.distinctBy { it.url }
     }
 
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH)
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
 
     private fun parseDate(dateStr: String): Long {
         return try {
-            // Remove timezone part if present
-            val cleanDate = dateStr.replace(Regex("\\+\\d{2}:\\d{2}$"), "")
-            dateFormat.parse(cleanDate)?.time ?: 0L
+            dateFormat.parse(dateStr)?.time ?: 0L
         } catch (e: Exception) {
             0L
         }
     }
 
-    // Pages
+    // Pages - images are at wcloud.site/series/{seriesId}/{chapterId}/{filename}.webp
+    // The filenames are sequential numbers
     override fun pageListRequest(chapter: SChapter): Request {
         return GET(baseUrl + chapter.url, headers)
     }
@@ -245,17 +189,29 @@ class WaveTeamy : HttpSource() {
         val html = response.body.string()
         val pages = mutableListOf<Page>()
 
-        // Pattern: projects/44/86/filename.jpg or .webp or .png
-        val imagePattern = """(projects/\d+/\d+/[^"'\s\\]+\.(jpg|png|webp))""".toRegex()
-
-        val imagePaths = imagePattern.findAll(html)
+        // Extract series internal ID and chapter number from the page data
+        // Pattern: projects/570/1/17000305301.webp or similar in the embedded data
+        val imagePattern = """(projects/\d+/\d+/\d+\.(?:jpg|png|webp))""".toRegex()
+        val matches = imagePattern.findAll(html)
             .map { it.groupValues[1] }
             .distinct()
             .toList()
 
-        imagePaths.forEachIndexed { index, path ->
-            pages.add(Page(index, "", "https://wcloud.site/$path"))
+        if (matches.isNotEmpty()) {
+            matches.forEachIndexed { index, path ->
+                pages.add(Page(index, "", "https://wcloud.site/$path"))
+            }
+            return pages
         }
+
+        // Fallback: try to find wcloud.site URLs directly
+        val wcloudPattern = """wcloud\.site/(series/\d+/\d+/[^"'\s\\]+\.(?:jpg|png|webp))""".toRegex()
+        wcloudPattern.findAll(html)
+            .map { it.groupValues[1] }
+            .distinct()
+            .forEachIndexed { index, path ->
+                pages.add(Page(index, "", "https://wcloud.site/$path"))
+            }
 
         return pages
     }
