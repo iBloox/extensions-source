@@ -28,6 +28,8 @@ class WaveTeamy : HttpSource() {
 
     override val baseUrl = "https://waveteamy.com"
 
+    private val apiUrl = "$baseUrl/wapi/hanout/v1"
+
     private val cdnUrl = "https://wcloud.site"
 
     override val lang = "ar"
@@ -45,7 +47,7 @@ class WaveTeamy : HttpSource() {
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("Accept", "*/*")
         .add("Origin", baseUrl)
-        .add("Referer", "$baseUrl/series")
+        .add("Referer", "$baseUrl/")
 
     // Popular - using API
     override fun popularMangaRequest(page: Int): Request {
@@ -53,7 +55,7 @@ class WaveTeamy : HttpSource() {
             .add("page", page.toString())
             .build()
 
-        return POST("$baseUrl/wapi/hanout/v1/series/series-list", headers, formBody)
+        return POST("$apiUrl/series/series-list", headers, formBody)
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
@@ -87,7 +89,7 @@ class WaveTeamy : HttpSource() {
             }
             .build()
 
-        return POST("$baseUrl/wapi/hanout/v1/series/series-list", headers, formBody)
+        return POST("$apiUrl/series/series-list", headers, formBody)
     }
 
     override fun searchMangaParse(response: Response) = popularMangaParse(response)
@@ -125,16 +127,15 @@ class WaveTeamy : HttpSource() {
     }
 
     private fun extractDoubleEscapedField(html: String, field: String): String? {
-        // Pattern for double-escaped JSON: \\\"field\\\":\\\"value\\\"
-        val pattern = """\\\\?"$field\\\\?":\\\\?"([^\\]*(?:\\\\.[^\\]*)*)\\\\?"""".toRegex()
+        val pattern = """\\?"$field\\?":\\?"([^"\\]*(?:\\.[^"\\]*)*)\\?"""".toRegex()
         val match = pattern.find(html)
         return match?.groupValues?.get(1)
-            ?.replace("\\\\\"", "\"")
             ?.replace("\\\"", "\"")
+            ?.replace("\\n", "\n")
     }
 
     private fun extractDoubleEscapedInt(html: String, field: String): Int? {
-        val pattern = """\\\\?"$field\\\\?":(\d+)""".toRegex()
+        val pattern = """\\?"$field\\?":(\d+)""".toRegex()
         val match = pattern.find(html)
         return match?.groupValues?.get(1)?.toIntOrNull()
     }
@@ -148,15 +149,10 @@ class WaveTeamy : HttpSource() {
         val html = response.body.string()
         val chapters = mutableListOf<SChapter>()
 
-        val seriesId = response.request.url.pathSegments.lastOrNull() ?: ""
-
-        // Extract internal series ID from cover URL: series/570/cover/...
-        val internalIdPattern = """series/(\d+)/cover/""".toRegex()
-        val internalIdMatch = internalIdPattern.find(html)
-        val internalId = internalIdMatch?.groupValues?.get(1) ?: ""
+        val postId = response.request.url.pathSegments.lastOrNull() ?: ""
 
         // Pattern for chapter data
-        val chapterPattern = """\{\\\\?"id\\\\?":(\d+),\\\\?"chapter\\\\?":(\d+),[^}]*\\\\?"postTime\\\\?":\\\\?"([^\\"]*)\\\\?"[^}]*\}""".toRegex()
+        val chapterPattern = """\{\\?"id\\?":(\d+),\\?"chapter\\?":(\d+),[^}]*\\?"postTime\\?":\\?"([^"\\]*)\\?"[^}]*\}""".toRegex()
 
         chapterPattern.findAll(html).forEach { match ->
             val chapterId = match.groupValues[1]
@@ -165,8 +161,8 @@ class WaveTeamy : HttpSource() {
 
             chapters.add(
                 SChapter.create().apply {
-                    // Store internalId in URL for use in pageListParse
-                    url = "/series/$seriesId/$chapterId#$internalId#$chapterNum"
+                    // URL format: /series/{postId}/{chapterNum} - use chapterNum for API
+                    url = "/series/$postId/$chapterNum"
                     name = "الفصل $chapterNum"
                     date_upload = parseDate(postTime)
                     chapter_number = chapterNum.toFloatOrNull() ?: -1f
@@ -187,52 +183,53 @@ class WaveTeamy : HttpSource() {
         }
     }
 
-    // Pages
+    // Pages - use API to get chapter info with images
     override fun pageListRequest(chapter: SChapter): Request {
-        // URL format: /series/{postId}/{chapterId}#{internalId}#{chapterNum}
-        val urlParts = chapter.url.split("#")
-        val basePath = urlParts[0]
-        return GET(baseUrl + basePath, headers)
+        val urlParts = chapter.url.split("/")
+        val postId = urlParts.getOrNull(2) ?: ""
+        val chapterNum = urlParts.getOrNull(3) ?: ""
+
+        val formBody = FormBody.Builder()
+            .add("postId", postId)
+            .add("chapter", chapterNum)
+            .build()
+
+        return POST("$apiUrl/series/chapters/chapter/web", headers, formBody)
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
+        val responseBody = response.body.string()
         val pages = mutableListOf<Page>()
 
-        // Extract internal series ID from the page
-        val internalIdPattern = """series/(\d+)/cover/""".toRegex()
-        val internalIdMatch = internalIdPattern.find(html)
-        val internalId = internalIdMatch?.groupValues?.get(1) ?: return pages
-
-        // Get chapter number from URL or page
-        val chapterNumPattern = """\\\\?"chapter\\\\?":(\d+)""".toRegex()
-        val chapterNumMatch = chapterNumPattern.find(html)
-        val chapterNum = chapterNumMatch?.groupValues?.get(1) ?: return pages
-
-        // Try to find image paths in the page
-        // Pattern: projects/{internalId}/{chapterNum}/{filename}.webp
-        val imagePattern = """projects/$internalId/$chapterNum/(\d+)\.(webp|jpg|png)""".toRegex()
-        val imageMatches = imagePattern.findAll(html).toList()
-
-        if (imageMatches.isNotEmpty()) {
-            imageMatches.forEachIndexed { index, match ->
-                val filename = match.groupValues[1]
-                val ext = match.groupValues[2]
-                pages.add(Page(index, "", "$cdnUrl/projects/$internalId/$chapterNum/$filename.$ext"))
+        // Try to parse as JSON first
+        try {
+            val chapterInfo = json.decodeFromString<ChapterInfoDto>(responseBody)
+            chapterInfo.images.forEachIndexed { index, imagePath ->
+                val imageUrl = if (imagePath.startsWith("http")) {
+                    imagePath
+                } else {
+                    "$cdnUrl/$imagePath"
+                }
+                pages.add(Page(index, "", imageUrl))
             }
             return pages
+        } catch (e: Exception) {
+            // Fallback: try to extract image paths from response
         }
 
-        // Fallback: Try to find any wcloud.site image URLs
-        val wcloudPattern = """wcloud\.site/(series/$internalId/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
-        wcloudPattern.findAll(html).forEachIndexed { index, match ->
-            pages.add(Page(index, "", "$cdnUrl/${match.groupValues[1]}"))
-        }
+        // Fallback: extract image paths using regex
+        val imagePattern = """(projects/\d+/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
+        imagePattern.findAll(responseBody)
+            .map { it.groupValues[1] }
+            .distinct()
+            .forEachIndexed { index, path ->
+                pages.add(Page(index, "", "$cdnUrl/$path"))
+            }
 
-        // If still no pages, try projects pattern without chapter restriction
+        // Another fallback: series path pattern
         if (pages.isEmpty()) {
-            val projectsPattern = """(projects/\d+/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
-            projectsPattern.findAll(html)
+            val seriesPattern = """(series/\d+/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
+            seriesPattern.findAll(responseBody)
                 .map { it.groupValues[1] }
                 .distinct()
                 .forEachIndexed { index, path ->
@@ -250,7 +247,7 @@ class WaveTeamy : HttpSource() {
     override fun imageRequest(page: Page): Request {
         val headers = headersBuilder()
             .add("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
-            .add("Referer", baseUrl)
+            .add("Referer", "$baseUrl/")
             .build()
         return GET(page.imageUrl!!, headers)
     }
@@ -265,5 +262,12 @@ class WaveTeamy : HttpSource() {
         val ratingValue: Double = 0.0,
         val statusValue: Int = 0,
         val postId: Long = 0,
+    )
+
+    @Serializable
+    data class ChapterInfoDto(
+        val images: List<String> = emptyList(),
+        val id: Int = 0,
+        val chapter: Int = 0,
     )
 }
