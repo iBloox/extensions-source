@@ -28,6 +28,8 @@ class WaveTeamy : HttpSource() {
 
     override val baseUrl = "https://waveteamy.com"
 
+    private val cdnUrl = "https://wcloud.site"
+
     override val lang = "ar"
 
     override val supportsLatest = false
@@ -62,14 +64,14 @@ class WaveTeamy : HttpSource() {
             SManga.create().apply {
                 url = "/series/${series.postId}"
                 title = series.title
-                thumbnail_url = "https://wcloud.site/${series.imageUrl}"
+                thumbnail_url = "$cdnUrl/${series.imageUrl}"
             }
         }
 
         return MangasPage(mangas, seriesList.size >= 20)
     }
 
-    // Latest - not supported, use popular instead
+    // Latest - not supported
     override fun latestUpdatesRequest(page: Int) = popularMangaRequest(page)
 
     override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
@@ -99,14 +101,15 @@ class WaveTeamy : HttpSource() {
         val html = response.body.string()
 
         return SManga.create().apply {
-            // Data is double-escaped: \\\"field\\\":\\\"value\\\"
             title = extractDoubleEscapedField(html, "name") ?: ""
-            description = extractDoubleEscapedField(html, "story")?.replace("\\\\n", "\n")?.replace("\\n", "\n")
+            description = extractDoubleEscapedField(html, "story")
+                ?.replace("\\\\n", "\n")
+                ?.replace("\\n", "\n")
             author = extractDoubleEscapedField(html, "author")
             artist = extractDoubleEscapedField(html, "artist")
 
             val coverPath = extractDoubleEscapedField(html, "cover")
-            thumbnail_url = coverPath?.let { "https://wcloud.site/$it" }
+            thumbnail_url = coverPath?.let { "$cdnUrl/$it" }
 
             val statusValue = extractDoubleEscapedInt(html, "status")
             status = when (statusValue) {
@@ -147,8 +150,12 @@ class WaveTeamy : HttpSource() {
 
         val seriesId = response.request.url.pathSegments.lastOrNull() ?: ""
 
-        // Pattern for double-escaped chapter data:
-        // {\\\"id\\\":15726,\\\"chapter\\\":76,...\\\"postTime\\\":\\\"2026-01-12 20:38:40\\\",...}
+        // Extract internal series ID from cover URL: series/570/cover/...
+        val internalIdPattern = """series/(\d+)/cover/""".toRegex()
+        val internalIdMatch = internalIdPattern.find(html)
+        val internalId = internalIdMatch?.groupValues?.get(1) ?: ""
+
+        // Pattern for chapter data
         val chapterPattern = """\{\\\\?"id\\\\?":(\d+),\\\\?"chapter\\\\?":(\d+),[^}]*\\\\?"postTime\\\\?":\\\\?"([^\\"]*)\\\\?"[^}]*\}""".toRegex()
 
         chapterPattern.findAll(html).forEach { match ->
@@ -158,7 +165,8 @@ class WaveTeamy : HttpSource() {
 
             chapters.add(
                 SChapter.create().apply {
-                    url = "/series/$seriesId/$chapterId"
+                    // Store internalId in URL for use in pageListParse
+                    url = "/series/$seriesId/$chapterId#$internalId#$chapterNum"
                     name = "الفصل $chapterNum"
                     date_upload = parseDate(postTime)
                     chapter_number = chapterNum.toFloatOrNull() ?: -1f
@@ -179,45 +187,72 @@ class WaveTeamy : HttpSource() {
         }
     }
 
-    // Pages - images are at wcloud.site/series/{seriesId}/{chapterId}/{filename}.webp
-    // The filenames are sequential numbers
+    // Pages
     override fun pageListRequest(chapter: SChapter): Request {
-        return GET(baseUrl + chapter.url, headers)
+        // URL format: /series/{postId}/{chapterId}#{internalId}#{chapterNum}
+        val urlParts = chapter.url.split("#")
+        val basePath = urlParts[0]
+        return GET(baseUrl + basePath, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
         val html = response.body.string()
         val pages = mutableListOf<Page>()
 
-        // Extract series internal ID and chapter number from the page data
-        // Pattern: projects/570/1/17000305301.webp or similar in the embedded data
-        val imagePattern = """(projects/\d+/\d+/\d+\.(?:jpg|png|webp))""".toRegex()
-        val matches = imagePattern.findAll(html)
-            .map { it.groupValues[1] }
-            .distinct()
-            .toList()
+        // Extract internal series ID from the page
+        val internalIdPattern = """series/(\d+)/cover/""".toRegex()
+        val internalIdMatch = internalIdPattern.find(html)
+        val internalId = internalIdMatch?.groupValues?.get(1) ?: return pages
 
-        if (matches.isNotEmpty()) {
-            matches.forEachIndexed { index, path ->
-                pages.add(Page(index, "", "https://wcloud.site/$path"))
+        // Get chapter number from URL or page
+        val chapterNumPattern = """\\\\?"chapter\\\\?":(\d+)""".toRegex()
+        val chapterNumMatch = chapterNumPattern.find(html)
+        val chapterNum = chapterNumMatch?.groupValues?.get(1) ?: return pages
+
+        // Try to find image paths in the page
+        // Pattern: projects/{internalId}/{chapterNum}/{filename}.webp
+        val imagePattern = """projects/$internalId/$chapterNum/(\d+)\.(webp|jpg|png)""".toRegex()
+        val imageMatches = imagePattern.findAll(html).toList()
+
+        if (imageMatches.isNotEmpty()) {
+            imageMatches.forEachIndexed { index, match ->
+                val filename = match.groupValues[1]
+                val ext = match.groupValues[2]
+                pages.add(Page(index, "", "$cdnUrl/projects/$internalId/$chapterNum/$filename.$ext"))
             }
             return pages
         }
 
-        // Fallback: try to find wcloud.site URLs directly
-        val wcloudPattern = """wcloud\.site/(series/\d+/\d+/[^"'\s\\]+\.(?:jpg|png|webp))""".toRegex()
-        wcloudPattern.findAll(html)
-            .map { it.groupValues[1] }
-            .distinct()
-            .forEachIndexed { index, path ->
-                pages.add(Page(index, "", "https://wcloud.site/$path"))
-            }
+        // Fallback: Try to find any wcloud.site image URLs
+        val wcloudPattern = """wcloud\.site/(series/$internalId/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
+        wcloudPattern.findAll(html).forEachIndexed { index, match ->
+            pages.add(Page(index, "", "$cdnUrl/${match.groupValues[1]}"))
+        }
+
+        // If still no pages, try projects pattern without chapter restriction
+        if (pages.isEmpty()) {
+            val projectsPattern = """(projects/\d+/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
+            projectsPattern.findAll(html)
+                .map { it.groupValues[1] }
+                .distinct()
+                .forEachIndexed { index, path ->
+                    pages.add(Page(index, "", "$cdnUrl/$path"))
+                }
+        }
 
         return pages
     }
 
     override fun imageUrlParse(response: Response): String {
         throw UnsupportedOperationException()
+    }
+
+    override fun imageRequest(page: Page): Request {
+        val headers = headersBuilder()
+            .add("Accept", "image/webp,image/apng,image/*,*/*;q=0.8")
+            .add("Referer", baseUrl)
+            .build()
+        return GET(page.imageUrl!!, headers)
     }
 
     override fun getFilterList() = FilterList()
