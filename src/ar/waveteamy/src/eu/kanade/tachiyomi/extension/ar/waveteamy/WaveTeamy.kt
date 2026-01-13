@@ -103,7 +103,6 @@ class WaveTeamy : HttpSource() {
         val html = response.body.string()
 
         return SManga.create().apply {
-            // Data is double-escaped: \\\"field\\\":\\\"value\\\"
             title = extractDoubleEscapedField(html, "name") ?: ""
             description = extractDoubleEscapedField(html, "story")
                 ?.replace("\\\\n", "\n")
@@ -129,7 +128,6 @@ class WaveTeamy : HttpSource() {
 
     private fun extractDoubleEscapedField(html: String, field: String): String? {
         // Pattern for double-escaped JSON: \\\"field\\\":\\\"value\\\"
-        // The value ends at the next \\\" or end of object
         val pattern = """\\\\?"$field\\\\?":\\\\?"([^"]*?)\\\\?"""".toRegex()
         val match = pattern.find(html)
         return match?.groupValues?.get(1)
@@ -154,11 +152,6 @@ class WaveTeamy : HttpSource() {
 
         val postId = response.request.url.pathSegments.lastOrNull() ?: ""
 
-        // Extract internal series ID from cover URL: series/570/cover/...
-        val internalIdPattern = """series/(\d+)/cover/""".toRegex()
-        val internalIdMatch = internalIdPattern.find(html)
-        val internalId = internalIdMatch?.groupValues?.get(1) ?: ""
-
         // Pattern for chapter data
         val chapterPattern = """\{\\\\?"id\\\\?":(\d+),\\\\?"chapter\\\\?":(\d+),[^}]*\\\\?"postTime\\\\?":\\\\?"([^"\\]*)\\\\?"[^}]*\}""".toRegex()
 
@@ -169,8 +162,7 @@ class WaveTeamy : HttpSource() {
 
             chapters.add(
                 SChapter.create().apply {
-                    // Store internalId and chapterNum for page loading
-                    url = "/series/$postId/$chapterId#$internalId#$chapterNum"
+                    url = "/series/$postId/$chapterNum"
                     name = "الفصل $chapterNum"
                     date_upload = parseDate(postTime)
                     chapter_number = chapterNum.toFloatOrNull() ?: -1f
@@ -191,57 +183,27 @@ class WaveTeamy : HttpSource() {
         }
     }
 
-    // Pages - load chapter page and extract images
+    // Pages - extract from Next.js script data
     override fun pageListRequest(chapter: SChapter): Request {
-        // URL format: /series/{postId}/{chapterId}#{internalId}#{chapterNum}
-        val urlParts = chapter.url.split("#")
-        val basePath = urlParts[0]
-        return GET(baseUrl + basePath, headers)
+        return GET(baseUrl + chapter.url, headers)
     }
 
     override fun pageListParse(response: Response): List<Page> {
         val html = response.body.string()
         val pages = mutableListOf<Page>()
 
-        // Extract internal series ID from the page
-        val internalIdPattern = """series/(\d+)/cover/""".toRegex()
-        val internalIdMatch = internalIdPattern.find(html)
-        val internalId = internalIdMatch?.groupValues?.get(1) ?: ""
+        // Extract image paths from self.__next_f.push script data
+        // Pattern: series/{internalId}/{chapterNum}/{filename}
+        val imagePattern = """series/(\d+)/(\d+)/(\d+)""".toRegex()
+        val matches = imagePattern.findAll(html)
+            .map { it.groupValues[0] }
+            .distinct()
+            .filter { !it.contains("cover") }
+            .toList()
 
-        // Try to find image paths in the page
-        // Pattern 1: projects/{internalId}/{chapterNum}/{filename}.webp
-        val projectsPattern = """projects/$internalId/\d+/(\d+)\.(webp|jpg|png)""".toRegex()
-        val projectMatches = projectsPattern.findAll(html).toList()
-
-        if (projectMatches.isNotEmpty()) {
-            projectMatches
-                .map { "${it.groupValues[0]}" }
-                .distinct()
-                .forEachIndexed { index, path ->
-                    pages.add(Page(index, "", "$cdnUrl/$path"))
-                }
-            return pages
+        matches.forEachIndexed { index, path ->
+            pages.add(Page(index, "", "$cdnUrl/$path.webp"))
         }
-
-        // Pattern 2: Any projects path
-        val anyProjectsPattern = """(projects/\d+/\d+/[^"'\s\\]+\.(webp|jpg|png))""".toRegex()
-        anyProjectsPattern.findAll(html)
-            .map { it.groupValues[1] }
-            .distinct()
-            .forEachIndexed { index, path ->
-                pages.add(Page(index, "", "$cdnUrl/$path"))
-            }
-
-        if (pages.isNotEmpty()) return pages
-
-        // Pattern 3: wcloud.site URLs
-        val wcloudPattern = """wcloud\.site/([^"'\s\\]+\.(webp|jpg|png))""".toRegex()
-        wcloudPattern.findAll(html)
-            .map { it.groupValues[1] }
-            .distinct()
-            .forEachIndexed { index, path ->
-                pages.add(Page(index, "", "$cdnUrl/$path"))
-            }
 
         return pages
     }
