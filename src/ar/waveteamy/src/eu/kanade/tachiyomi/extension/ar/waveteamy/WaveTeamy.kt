@@ -10,14 +10,15 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.Jsoup
+import uy.kohesive.injekt.injectLazy
+import java.text.SimpleDateFormat
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 class WaveTeamy : HttpSource() {
@@ -30,15 +31,12 @@ class WaveTeamy : HttpSource() {
 
     override val supportsLatest = true
 
-    private val json = Json {
-        ignoreUnknownKeys = true
-        isLenient = true
-    }
+    private val json: Json by injectLazy()
 
     override val client: OkHttpClient = network.cloudflareClient.newBuilder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
-        .rateLimit(10, 1, TimeUnit.SECONDS)
+        .rateLimit(2, 1, TimeUnit.SECONDS)
         .build()
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
@@ -46,7 +44,7 @@ class WaveTeamy : HttpSource() {
         .add("Origin", baseUrl)
         .add("Referer", "$baseUrl/series")
 
-    // Popular
+    // Popular - using API
     override fun popularMangaRequest(page: Int): Request {
         val formBody = FormBody.Builder()
             .add("page", page.toString())
@@ -56,7 +54,8 @@ class WaveTeamy : HttpSource() {
     }
 
     override fun popularMangaParse(response: Response): MangasPage {
-        val seriesList = json.decodeFromString<List<SeriesDto>>(response.body.string())
+        val responseBody = response.body.string()
+        val seriesList = json.decodeFromString<List<SeriesDto>>(responseBody)
 
         val mangas = seriesList.map { series ->
             SManga.create().apply {
@@ -66,7 +65,7 @@ class WaveTeamy : HttpSource() {
             }
         }
 
-        return MangasPage(mangas, false)
+        return MangasPage(mangas, seriesList.size >= 20)
     }
 
     // Latest
@@ -88,9 +87,7 @@ class WaveTeamy : HttpSource() {
         return POST("$baseUrl/wapi/hanout/v1/series/series-list", headers, formBody)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        return popularMangaParse(response)
-    }
+    override fun searchMangaParse(response: Response) = popularMangaParse(response)
 
     // Manga Details
     override fun mangaDetailsRequest(manga: SManga): Request {
@@ -98,30 +95,46 @@ class WaveTeamy : HttpSource() {
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val document = Jsoup.parse(response.body.string())
+        val html = response.body.string()
 
         return SManga.create().apply {
-            title = document.select("h1").first()?.text() ?: ""
+            // Extract from escaped JSON: \"name\":\"...\",\"story\":\"...\"
+            title = extractEscapedField(html, "name") ?: ""
+            description = extractEscapedField(html, "story")?.replace("\\n", "\n")
+            author = extractEscapedField(html, "author")
+            artist = extractEscapedField(html, "artist")
 
-            description = document.select("div:contains(القصة)").parents().first()
-                ?.text()?.substringAfter("القصة")?.trim() ?: ""
+            val coverPath = extractEscapedField(html, "cover")
+            thumbnail_url = if (!coverPath.isNullOrEmpty()) {
+                "https://wcloud.site/$coverPath"
+            } else {
+                null
+            }
 
-            thumbnail_url = document.select("img[src*='wcloud'], img[src*='cover']")
-                .first()?.attr("abs:src") ?: ""
-
-            val statusText = document.text()
-            status = when {
-                statusText.contains("مستمر") -> SManga.ONGOING
-                statusText.contains("منتهي") -> SManga.COMPLETED
-                statusText.contains("متوقف") -> SManga.ON_HIATUS
+            val statusValue = extractEscapedNumber(html, "status")
+            status = when (statusValue) {
+                0 -> SManga.ONGOING
+                1 -> SManga.COMPLETED
+                2 -> SManga.ON_HIATUS
                 else -> SManga.UNKNOWN
             }
 
-            genre = document.select("a[href*='/genre/']").joinToString { it.text() }
-
-            author = document.select("div:contains(المؤلف), span:contains(المؤلف)")
-                .text().replace("المؤلف:", "").replace("المؤلف", "").trim()
+            val typeValue = extractEscapedField(html, "type") ?: ""
+            genre = typeValue.takeIf { it.isNotEmpty() }
         }
+    }
+
+    private fun extractEscapedField(html: String, field: String): String? {
+        // Pattern: \"field\":\"value\" or \"field\":\"value with \\\" escaped quotes\"
+        val pattern = """\\?"$field\\?":\\?"([^"\\]*(?:\\.[^"\\]*)*)\\?"""".toRegex()
+        val match = pattern.find(html)
+        return match?.groupValues?.get(1)?.replace("\\\"", "\"")?.replace("\\\\", "\\")
+    }
+
+    private fun extractEscapedNumber(html: String, field: String): Int? {
+        val pattern = """\\?"$field\\?":(\d+)""".toRegex()
+        val match = pattern.find(html)
+        return match?.groupValues?.get(1)?.toIntOrNull()
     }
 
     // Chapters
@@ -130,16 +143,44 @@ class WaveTeamy : HttpSource() {
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val document = Jsoup.parse(response.body.string())
+        val html = response.body.string()
+        val chapters = mutableListOf<SChapter>()
 
-        return document.select("a[href*='/chapter/'], a[href*='/ch/']").map { element ->
-            SChapter.create().apply {
-                setUrlWithoutDomain(element.attr("href"))
-                name = element.text().ifEmpty {
-                    element.attr("href").substringAfterLast("/").replace("-", " ")
-                }
-                date_upload = 0L
-            }
+        val seriesId = response.request.url.pathSegments.lastOrNull() ?: ""
+
+        // Pattern: {\"id\":15410,\"chapter\":49,...\"postTime\":\"2025-12-22 19:38:31\",...}
+        val chapterPattern = """\{\\?"id\\?":\s*(\d+),\\?"chapter\\?":\s*(\d+),[^}]*\\?"title\\?":\\?"([^"\\]*)\\?"[^}]*\\?"postTime\\?":\\?"([^"\\]*)\\?"[^}]*\}""".toRegex()
+
+        chapterPattern.findAll(html).forEach { match ->
+            val chapterId = match.groupValues[1]
+            val chapterNum = match.groupValues[2]
+            val chapterTitle = match.groupValues[3].trim()
+            val postTime = match.groupValues[4]
+
+            chapters.add(
+                SChapter.create().apply {
+                    url = "/series/$seriesId/$chapterId"
+                    name = if (chapterTitle.isNotEmpty()) {
+                        "الفصل $chapterNum: $chapterTitle"
+                    } else {
+                        "الفصل $chapterNum"
+                    }
+                    date_upload = parseDate(postTime)
+                    chapter_number = chapterNum.toFloatOrNull() ?: -1f
+                },
+            )
+        }
+
+        return chapters
+    }
+
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ENGLISH)
+
+    private fun parseDate(dateStr: String): Long {
+        return try {
+            dateFormat.parse(dateStr)?.time ?: 0L
+        } catch (e: Exception) {
+            0L
         }
     }
 
@@ -149,20 +190,22 @@ class WaveTeamy : HttpSource() {
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = Jsoup.parse(response.body.string())
-        val images = document.select("img[src*='wcloud'], img[src*='cdn'], img[class*='page']")
+        val html = response.body.string()
+        val pages = mutableListOf<Page>()
 
-        return images.mapIndexedNotNull { index, element ->
-            val imageUrl = element.attr("abs:src").ifEmpty {
-                element.attr("abs:data-src")
-            }
+        // Pattern: projects/553/49/filename.jpg or .webp or .png
+        val imagePattern = """(projects/\d+/\d+/[^"'\s\\]+\.(jpg|png|webp))""".toRegex()
 
-            if (imageUrl.isNotEmpty() && imageUrl.contains("http")) {
-                Page(index, "", imageUrl)
-            } else {
-                null
-            }
+        val imagePaths = imagePattern.findAll(html)
+            .map { it.groupValues[1] }
+            .distinct()
+            .toList()
+
+        imagePaths.forEachIndexed { index, path ->
+            pages.add(Page(index, "", "https://wcloud.site/$path"))
         }
+
+        return pages
     }
 
     override fun imageUrlParse(response: Response): String {
@@ -173,11 +216,11 @@ class WaveTeamy : HttpSource() {
 
     @Serializable
     data class SeriesDto(
-        val id: Int,
-        val title: String,
-        val imageUrl: String,
-        val ratingValue: Double,
-        val statusValue: Int,
-        val postId: Long,
+        val id: Int = 0,
+        val title: String = "",
+        val imageUrl: String = "",
+        val ratingValue: Double = 0.0,
+        val statusValue: Int = 0,
+        val postId: Long = 0,
     )
 }
