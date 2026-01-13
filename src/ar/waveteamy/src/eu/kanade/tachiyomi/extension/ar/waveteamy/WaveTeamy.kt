@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import okhttp3.FormBody
 import okhttp3.Headers
@@ -55,7 +56,7 @@ class WaveTeamy : HttpSource() {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val responseBody = response.body.string()
-        val seriesList = json.decodeFromString<List<SeriesDto>>(string = responseBody)
+        val seriesList = json.decodeFromString<List<SeriesDto>>(responseBody)
 
         val mangas = seriesList.map { series ->
             SManga.create().apply {
