@@ -55,7 +55,7 @@ class WaveTeamy : HttpSource() {
 
     override fun popularMangaParse(response: Response): MangasPage {
         val responseBody = response.body.string()
-        val seriesList = json.decodeFromString<List<SeriesDto>>(responseBody)
+        val seriesList = json.decodeFromString<List<SeriesDto>>(string = responseBody)
 
         val mangas = seriesList.map { series ->
             SManga.create().apply {
